@@ -4,9 +4,7 @@ from typing import (Dict, Iterable, List, Literal, Optional, Tuple, TypedDict,
 import torch
 import torch.nn as nn
 from PIL import Image
-# TODO(xwjiang): We should port CLIPVisionModel's code over to not depend on
-# transformers' impl.
-from transformers import CLIPVisionModel, LlavaNextConfig
+from transformers import LlavaNextConfig
 from transformers.models.llava_next.modeling_llava_next import (
     get_anyres_image_grid_shape, unpad_image)
 from typing_extensions import NotRequired
@@ -20,14 +18,15 @@ from vllm.model_executor.layers.quantization.base_config import (
 from vllm.model_executor.layers.sampler import Sampler
 from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
+from vllm.model_executor.models.clip import CLIPVisionModel
 from vllm.model_executor.models.llama import LlamaModel
 from vllm.model_executor.sampling_metadata import SamplingMetadata
 from vllm.multimodal import MULTIMODAL_REGISTRY, MultiModalData
 from vllm.multimodal.image import ImagePixelData, get_dummy_image_data
 from vllm.sequence import SamplerOutput, SequenceData
 
+from .interfaces import SupportsVision
 from .llava import LlavaMultiModalProjector, merge_vision_embeddings
-from .vlm_base import VisionLanguageModelBase
 
 logger = init_logger(__name__)
 
@@ -107,21 +106,21 @@ def _image_pixel_processor(
 
 @MULTIMODAL_REGISTRY.register_image_pixel_input(_image_pixel_processor)
 @MULTIMODAL_REGISTRY.register_dummy_data(_get_dummy_image_data)
-class LlavaNextForConditionalGeneration(VisionLanguageModelBase):
+class LlavaNextForConditionalGeneration(nn.Module, SupportsVision):
 
     def __init__(self,
                  config: LlavaNextConfig,
-                 vision_language_config: VisionLanguageConfig,
+                 vlm_config: VisionLanguageConfig,
                  cache_config: Optional[CacheConfig] = None,
                  quant_config: Optional[QuantizationConfig] = None) -> None:
-        super().__init__(vision_language_config)
+        super().__init__()
 
-        # Update the type annotation from that of its superclass
         self.config = config
+        self.vlm_config = vlm_config
 
-        if self.vision_language_config.image_input_type == (
+        if self.vlm_config.image_input_type == (
                 VisionLanguageConfig.ImageInputType.PIXEL_VALUES):
-            self.vision_tower = CLIPVisionModel(config.vision_config)
+            self.vision_tower = CLIPVisionModel(config=config.vision_config)
         else:
             raise TypeError("Image features are not supported by LLaVA-NeXT")
 
@@ -147,7 +146,7 @@ class LlavaNextForConditionalGeneration(VisionLanguageModelBase):
             torch.empty(config.text_config.hidden_size))
 
     def _validate_image_pixels(self, data: torch.Tensor) -> torch.Tensor:
-        _, num_channels, _, _ = self.vision_language_config.image_input_shape
+        _, num_channels, _, _ = self.vlm_config.image_input_shape
 
         # Note that this is different from that of vLLM vision_language_config
         # since the image is resized by the HuggingFace preprocessor
@@ -178,7 +177,7 @@ class LlavaNextForConditionalGeneration(VisionLanguageModelBase):
         image_sizes = kwargs.pop("image_sizes", None)
         image_features = kwargs.pop("image_features", None)
 
-        expected_input_type = self.vision_language_config.image_input_type
+        expected_input_type = self.vlm_config.image_input_type
         ImageInputType = VisionLanguageConfig.ImageInputType
 
         if expected_input_type == ImageInputType.PIXEL_VALUES:
@@ -219,12 +218,11 @@ class LlavaNextForConditionalGeneration(VisionLanguageModelBase):
 
     def _image_pixels_to_features(self, vision_tower: CLIPVisionModel,
                                   pixel_values: torch.Tensor) -> torch.Tensor:
-        # TODO(xwjiang): Maybe port minimal CLIPVisionModel over.
-        image_outputs = vision_tower(pixel_values.to(vision_tower.device),
-                                     output_hidden_states=True)
 
-        image_features = image_outputs.hidden_states[
-            self.config.vision_feature_layer]
+        # NOTE: we skip the step to select the vision feature layer since
+        # this is already done inside the vision tower
+        image_features = vision_tower(pixel_values.to(vision_tower.device),
+                                      self.config.vision_feature_layer)
 
         return self._select_image_features(
             image_features,
@@ -388,7 +386,7 @@ class LlavaNextForConditionalGeneration(VisionLanguageModelBase):
 
             inputs_embeds = merge_vision_embeddings(
                 input_ids, inputs_embeds, vision_embeddings,
-                self.vision_language_config.image_token_id)
+                self.vlm_config.image_token_id)
 
             input_ids = None
         else:
@@ -429,6 +427,9 @@ class LlavaNextForConditionalGeneration(VisionLanguageModelBase):
         params_dict = dict(self.named_parameters())
         for name, loaded_weight in weights:
             if "rotary_emb.inv_freq" in name:
+                continue
+            # post_layernorm is not needed in CLIPVisionModel
+            if "vision_model.post_layernorm" in name:
                 continue
             for key_to_modify, new_key in _KEYS_TO_MODIFY_MAPPING.items():
                 if key_to_modify in name:
